@@ -8,7 +8,7 @@ class EKFAC(torch.optim.Optimizer):
 
     def __init__(self,
                  network,
-                 recompute_KFAC_steps=10,
+                 recompute_KFAC_steps=1,
                  epsilon=0.1):
         """
         Arguments:
@@ -65,7 +65,7 @@ class EKFAC(torch.optim.Optimizer):
             self.compute_Kronecker_matrices()
 
         self.compute_scalings()
-        self.precondition()
+#         self.precondition()
 
         self.iteration_number += 1
 
@@ -73,14 +73,16 @@ class EKFAC(torch.optim.Optimizer):
         """ When called before running each layer with weights, this function stores
         the input to the layer"""
 
-        self.stored_items[module]['input'] = inputs_to_module[0].t()
+        self.stored_items[module]['input'] = inputs_to_module[0]
 
     def store_grad_output(self, module, grad_wrt_input, grad_wrt_output):
         """ When called after the backward pass of each layer with weights, this function
         stores the gradient of the backwards-running function (usually the loss function) with respect
         to the pre-activations, i.e. the output of the layer"""
 
-        self.stored_items[module]['grad_wrt_output'] = grad_wrt_output[0]
+        # We have to scale by the batch size, because the grad_wrt_output which is passed to the
+        # function is already scaled down by batch_size, even though we did not do any reduction
+        self.stored_items[module]['grad_wrt_output'] = grad_wrt_output[0] * grad_wrt_output[0].size(0)
 
     def compute_Kronecker_matrices(self):
         """ For each layer (or, more properly, parameter group), computes the Kronecker-factored matrices,
@@ -91,7 +93,7 @@ class EKFAC(torch.optim.Optimizer):
 
         for layer, stored_values in self.stored_items.items():
             # notation follows the EKFAC paper
-            h = stored_values['input']
+            h = stored_values['input'].t()
             delta = stored_values['grad_wrt_output']
 
             # We want E[ h @ h.T]
@@ -114,7 +116,7 @@ class EKFAC(torch.optim.Optimizer):
         for layer, stored_values in self.stored_items.items():
             UA = stored_values['UA']
             UB = stored_values['UB']
-            h = stored_values['input']
+            h = stored_values['input'].t()
             delta = stored_values['grad_wrt_output']
 
             with torch.no_grad():
@@ -123,7 +125,7 @@ class EKFAC(torch.optim.Optimizer):
                 # Because delta and h contain information for each training example in the mini-batch,
                 # when we do the matrix multiplication in the middle, we are averaging over the mini-batch.
                 # So, we need to square the values first, so we can square-then-average, not average-then-square.
-                scalings = ((UB @ delta.t())**2) @ ((h.t() @ UA.t())**2) / batch_size
+                scalings = ((UB.t() @ delta.t())**2) @ ((h.t() @ UA)**2) / batch_size
 
             stored_values['scalings'] = scalings
 
@@ -142,9 +144,10 @@ class EKFAC(torch.optim.Optimizer):
 
             layer.weight.grad.data = grad_mb_orig
 
-    def approximate_Fisher_matrix(self):
+    def approximate_Fisher_matrix(self, to_return=False):
         """ For testing/debugging, compute the layer-wise approximation to the empirical Fisher matrix
             to compare to the Fischer information matrix """
+        approximate_Fisher_matrices = []
         for layer, stored_values in self.stored_items.items():
 
             UA = stored_values['UA'].numpy()
@@ -154,9 +157,59 @@ class EKFAC(torch.optim.Optimizer):
             UAkronUB = np.kron(UA, UB)
 
             approximate_Fisher = UAkronUB @ S @ UAkronUB.T
+            approximate_Fisher_matrices.append(approximate_Fisher)
 
             stored_values['aproximate_Fisher'] = torch.tensor(approximate_Fisher)
 
-    def empirical_Fisher_matrix(self):
-        """ For testing/debugging, compute the layer-wise empirical Fisher matrix"""
+        if to_return:
+            return approximate_Fisher_matrices
 
+    def compute_hdeltaT(self):
+        """ For testing/debugging, compute the layer-wise h delta T product.
+        The minibatch-averaged h delta^T product should be equal to the gradient of the
+        weigt matrix for each linear layer."""
+
+        for layer, stored_values in self.stored_items.items():
+            h = stored_values['input']
+            delta = stored_values['grad_wrt_output']
+            stored_values['hdeltaT'] = h.t() @ delta / h.size(0)
+
+    def compute_empirical_Fisher_matrix(self, to_return=False):
+        """ For testing/debugging, compute empirical Fisher matrix """
+
+        empirical_fisher_matrices = []
+        for layer, stored_values in self.stored_items.items():
+            h = stored_values['input']
+            delta = stored_values['grad_wrt_output']
+
+            with torch.no_grad():
+                empirical_fisher_matrix = empirical_fisher(h, delta)
+                stored_values['empirical_fisher'] = empirical_fisher_matrix
+                empirical_fisher_matrices.append(empirical_fisher_matrix)
+
+        if to_return:
+            return empirical_fisher_matrices
+
+def outer_prod_individual(M1, M2):
+    """ takes the outer product of M1 and M2, where M1 is NxA, and M2 is NxB
+    """
+    return torch.einsum('ij,ik->ijk', M1, M2)
+
+def vectorize_individual(M):
+    """ Given a tensor M, with size (A, B, C), vectorizes this tensor, leaving the first dimension intact,
+    by stacking columns, resulting in a tensor of size (A, BC)"""
+    Mt = M.transpose(1,2)
+    return Mt.contiguous().view(Mt.size(0), -1)
+
+def empirical_fisher(h, delta):
+    """ given h, representing the input to a layer, and delta, representing the gradient with respect to its output,
+    computes the empirical fisher matrix, averaged over the minibatch
+
+    Arguments:
+    h - torch.tensor, dimension (batch_size) * (n_inputs)
+    delta - torch.tensor, dimension (batch_size) * (n_outputs)"""
+
+    grad_individual = outer_prod_individual(h, delta)
+    vec_grad_individual = vectorize_individual(grad_individual)
+    fisher_individual = outer_prod_individual(vec_grad_individual, vec_grad_individual)
+    return fisher_individual.mean(0)
