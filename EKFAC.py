@@ -80,11 +80,12 @@ class EKFAC(torch.optim.Optimizer):
         stores the gradient of the backwards-running function (usually the loss function) with respect
         to the pre-activations, i.e. the output of the layer"""
 
-        # We have to scale by the batch size, because the grad_wrt_output which is passed to the
-        # function is already scaled down by batch_size, even though we did not do any reduction
+        """ We have to scale by the batch size, because the grad_wrt_output which is passed to the
+         function is already scaled down by batch_size, even though we did not do any reduction """
         self.stored_items[module]['grad_wrt_output'] = grad_wrt_output[0] * grad_wrt_output[0].size(0)
 
     def compute_Kronecker_matrices(self):
+        
         """ For each layer (or, more properly, parameter group), computes the Kronecker-factored matrices,
         where the Kronecker factors are defined by
         A = E[input_to_layer @ input_to_layer.T]
