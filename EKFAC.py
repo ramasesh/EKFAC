@@ -143,7 +143,7 @@ class EKFAC(torch.optim.Optimizer):
                 # So, we need to square the values first, so we can square-then-average, not average-then-square.
                 scalings = ((UB.t() @ delta.t())**2) @ ((h.t() @ UA)**2) / batch_size
 
-            if not self.running_average:
+            if (not self.running_average) or (self.iteration_number % self.recompute_KFAC_steps == 0):
                 stored_values['scalings'] = scalings
             else:
                 stored_values['scalings'] = self.alpha * scalings + (1 - self.alpha) * stored_values['scalings']
