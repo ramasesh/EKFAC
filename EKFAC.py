@@ -54,6 +54,7 @@ class EKFAC(torch.optim.Optimizer):
 
                 # make a label for the module and add it to the keys of the stored_items dictionary
                 tracked_modules_count += 1
+
                 self.stored_items[layer] = {}
 
         default_options = {}
@@ -73,7 +74,13 @@ class EKFAC(torch.optim.Optimizer):
         """ When called before running each layer with weights, this function stores
         the input to the layer"""
 
-        self.stored_items[module]['input'] = inputs_to_module[0]
+        inp = inputs_to_module[0]
+        if module.bias is None:
+            self.stored_items[module]['input'] = inp
+        else:
+            # if we have a bias, we use the trick of pretending that the input x is augmented with
+            # a vector of ones
+            self.stored_items[module]['input'] = torch.cat((inp, torch.ones((inp.size(0), 1))), dim=1)
 
     def store_grad_output(self, module, grad_wrt_input, grad_wrt_output):
         """ When called after the backward pass of each layer with weights, this function
@@ -82,10 +89,10 @@ class EKFAC(torch.optim.Optimizer):
 
         """ We have to scale by the batch size, because the grad_wrt_output which is passed to the
          function is already scaled down by batch_size, even though we did not do any reduction """
+
         self.stored_items[module]['grad_wrt_output'] = grad_wrt_output[0] * grad_wrt_output[0].size(0)
 
     def compute_Kronecker_matrices(self):
-        
         """ For each layer (or, more properly, parameter group), computes the Kronecker-factored matrices,
         where the Kronecker factors are defined by
         A = E[input_to_layer @ input_to_layer.T]
@@ -122,7 +129,6 @@ class EKFAC(torch.optim.Optimizer):
 
             with torch.no_grad():
                 batch_size = h.shape[1]
-                # TODO Check that this is correct
                 # Because delta and h contain information for each training example in the mini-batch,
                 # when we do the matrix multiplication in the middle, we are averaging over the mini-batch.
                 # So, we need to square the values first, so we can square-then-average, not average-then-square.
@@ -138,12 +144,22 @@ class EKFAC(torch.optim.Optimizer):
 
             S = stored_values['scalings']
 
-            grad_mb = layer.weight.grad.data # mb stands for 'mini-batch'
-            grad_mb_kfe = UB @ grad_mb @ UA.t()
-            grad_mb_kfe_scaled = grad_mb_kfe / (S + self.epsilon)
-            grad_mb_orig = UB.t() @ grad_mb @ UA # back to original basis
-
-            layer.weight.grad.data = grad_mb_orig
+            if layer.bias is None:
+                grad_mb = layer.weight.grad # mb stands for 'mini-batch'
+                grad_mb_kfe = UB @ grad_mb @ UA.t()
+                grad_mb_kfe_scaled = grad_mb_kfe / (S + self.epsilon)
+                grad_mb_orig = UB.t() @ grad_mb @ UA # back to original basis
+                layer.weight.grad.data = grad_mb_orig
+            else:
+                grad_mb_W = layer.weight.grad
+                grad_mb_b = layer.bias.grad
+                grad_mb = torch.cat(grad_mb_W, grad_mb_b, dim=1)
+                grad_mb_kfe = UB @ grad_mb @ UA.t()
+                grad_mb_kfe_scaled = grad_mb_kfe / (S + self.epsilon)
+                grad_mb_orig = UB.t() @ grad_mb @ UA # back to original basis
+    
+                layer.weight.grad.data = grad_mb_orig[:,:-1]
+                layer.bias.grad.data = grad_mb_orig[:,-1]
 
     def approximate_Fisher_matrix(self, to_return=False):
         """ For testing/debugging, compute the layer-wise approximation to the empirical Fisher matrix
