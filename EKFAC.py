@@ -9,15 +9,24 @@ class EKFAC(torch.optim.Optimizer):
     def __init__(self,
                  network,
                  recompute_KFAC_steps=1,
+                 running_average=True,
+                 alpha=0.75
                  epsilon=0.1):
+
         """
         Arguments:
             network - the network to operate on
             recompute_KFAC_steps (integer) - the number of steps between successive recomputations of the
                                              Kronecker factors of the layer-wise Fisher matrix
-            epsilon (float) - the damping parameter used to avoid infinities"""
+            epsilon (float) - the damping parameter used to avoid infinities
+            running_average (bool) - if True, will keep a running average of the diagonal elements of the 
+                                     scaling matrix (the approximate eigenvalues) rather than recomputing 
+                                     from scratch for each iteration"""
 
         self.epsilon = epsilon
+        self.running_average = running_average
+        if self.running_average:
+            self.alpha = alpha
 
         self.params_by_layer = []
 
@@ -134,7 +143,10 @@ class EKFAC(torch.optim.Optimizer):
                 # So, we need to square the values first, so we can square-then-average, not average-then-square.
                 scalings = ((UB.t() @ delta.t())**2) @ ((h.t() @ UA)**2) / batch_size
 
-            stored_values['scalings'] = scalings
+            if not self.running_average:
+                stored_values['scalings'] = scalings
+            else:
+                stored_values['scalings'] = self.alpha * scalings + (1 - self.alpha) * stored_values['scalings']
 
     def precondition(self):
         for layer, stored_values in self.stored_items.items():
