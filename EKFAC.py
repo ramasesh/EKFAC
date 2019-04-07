@@ -1,6 +1,7 @@
 import torch
 import warnings
 
+
 class EKFAC(torch.optim.Optimizer):
     """ Implements the Eigenvalue-corrected Kronecker-factored Optimized Curvature preconditioner
 
@@ -19,8 +20,8 @@ class EKFAC(torch.optim.Optimizer):
             recompute_KFAC_steps (integer) - the number of steps between successive recomputations of the
                                              Kronecker factors of the layer-wise Fisher matrix
             epsilon (float) - the damping parameter used to avoid infinities
-            running_average (bool) - if True, will keep a running average of the diagonal elements of the 
-                                     scaling matrix (the approximate eigenvalues) rather than recomputing 
+            running_average (bool) - if True, will keep a running average of the diagonal elements of the
+                                     scaling matrix (the approximate eigenvalues) rather than recomputing
                                      from scratch for each iteration"""
 
         self.epsilon = epsilon
@@ -110,23 +111,74 @@ class EKFAC(torch.optim.Optimizer):
 
         for layer, stored_values in self.stored_items.items():
             # notation follows the EKFAC paper
-            h = stored_values['input'].t()
+            h = stored_values['input']
             delta = stored_values['grad_wrt_output']
 
-            # We want E[ h @ h.T]
-            # h should always be of size (n_inputs, batch_size)
-            # delta should be of size (batch_size, n_outputs)
-            with torch.no_grad():
-                A = h @ h.transpose(1,0) / h.shape[1]
-                B = delta.transpose(1,0) @ delta / delta.shape[0]
+            if type(layer) == torch.nn.Linear:
+                h = h.t()
 
-            # Eigendecompose A and B to get UA and UB, which contain the eigenvectors
-            # UA @ diag(EvalsA) @ UA.t() = A
-            EvalsA, UA = torch.symeig(A, eigenvectors=True)
-            EvalsB, UB = torch.symeig(B, eigenvectors=True)
+                # We want E[ h @ h.T]
+                # h should always be of size (n_inputs, batch_size)
+                # delta should be of size (batch_size, n_outputs)
+                with torch.no_grad():
+                    A = h @ h.transpose(1,0) / h.shape[1]
+                    B = delta.transpose(1,0) @ delta / delta.shape[0]
 
-            self.stored_items[layer]['UA'] = UA
-            self.stored_items[layer]['UB'] = UB
+                # Eigendecompose A and B to get UA and UB, which contain the eigenvectors
+                # UA @ diag(EvalsA) @ UA.t() = A
+                EvalsA, UA = torch.symeig(A, eigenvectors=True)
+                EvalsB, UB = torch.symeig(B, eigenvectors=True)
+
+                self.stored_items[layer]['UA'] = UA
+                self.stored_items[layer]['UB'] = UB
+
+            elif type(layer) == torch.nn.Conv1d:
+
+                with torch.no_grad():
+                    reshaped_input = torch.nn.functional.conv1d(h,
+                                                                weight=self.get_conv_filter(layer),
+                                                                padding=layer.padding,
+                                                                stride=layer.stride)
+
+
+def get_conv_filter(mod):
+    """Convolution filter that extracts input patches."""
+    dimension = len(mod.kernel_size)
+    if dimension == 1:
+        kernel_size, = mod.kernel_size
+
+        g_filter = torch.eye(kernel_size*mod.in_channels,
+                             dtype=mod.weight.dtype,
+                             device=mod.weight.device)
+
+        return g_filter.view(kernel_size*mod.in_channels,
+                             mod.in_channels,
+                             kernel_size)
+
+    elif dimension == 2:
+        kernel_width, kernel_height = mod.kernel_size
+
+        g_filter = torch.eye(kernel_width*kernel_height*mod.in_channels,
+                             dtype=mod.weight.dtype,
+                             device=mod.weight.device)
+
+        return g_filter.view(kernel_width*kernel_height*mod.in_channels,
+                             mod.in_channels,
+                             kernel_width,
+                             kernel_height)
+
+    elif dimension == 3:
+        kernel_width, kernel_height, kernel_depth = mod.kernel_size
+
+        g_filter = torch.eye(kernel_width*kernel_height*kernel_depth*mod.in_channels,
+                             dtype=mod.weight.dtype,
+                             device=mod.weight.device)
+
+        return g_filter.view(kernel_width*kernel_height*kernel_depth*mod.in_channels,
+                             mod.in_channels,
+                             kernel_width,
+                             kernel_height,
+                             kernel_depth)
 
     def compute_scalings(self):
 
@@ -169,7 +221,7 @@ class EKFAC(torch.optim.Optimizer):
                 grad_mb_kfe = UB @ grad_mb @ UA.t()
                 grad_mb_kfe_scaled = grad_mb_kfe / (S + self.epsilon)
                 grad_mb_orig = UB.t() @ grad_mb @ UA # back to original basis
-    
+
                 layer.weight.grad.data = grad_mb_orig[:,:-1]
                 layer.bias.grad.data = grad_mb_orig[:,-1]
 
